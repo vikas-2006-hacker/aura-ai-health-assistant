@@ -37,6 +37,23 @@ def notifications(db: Session = Depends(get_db), user=Depends(get_current_user))
     return WellnessService(db).get_notifications(user.id)
 
 
+@router.get("/notifications/unread", status_code=status.HTTP_200_OK)
+def unread_notifications(db: Session = Depends(get_db), user=Depends(get_current_user)) -> dict:
+    return WellnessService(db).get_unread_notifications(user.id)
+
+
+@router.patch("/notifications/{notification_id}/read", status_code=status.HTTP_200_OK)
+def mark_notification_read(
+    notification_id: int,
+    db: Session = Depends(get_db),
+    user=Depends(get_current_user),
+) -> dict:
+    result = WellnessService(db).mark_notification_read(user.id, notification_id)
+    if result is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Notification not found")
+    return result
+
+
 @router.get("/insights/changes", status_code=status.HTTP_200_OK)
 def insights_changes(db: Session = Depends(get_db), user=Depends(get_current_user)) -> dict:
     return WellnessService(db).get_change_insights(user.id)

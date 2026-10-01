@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 from datetime import datetime, time, timedelta, timezone
+import hashlib
+import json
 from typing import Any
 
-from sqlalchemy import or_
+from sqlalchemy import func, or_
 from sqlalchemy.orm import Session
 
 from app.models.sensor_record import SensorRecord
@@ -262,6 +264,8 @@ class WellnessService:
 
         for item in items:
             self._record_recommendation(user_id, item)
+
+        self._generate_notifications_from_recommendations(user_id, items)
 
         return {
             "items": [self._serialize_recommendation(item) for item in items],
@@ -659,20 +663,173 @@ class WellnessService:
         return self.get_notification_preferences(user_id)
 
     def get_notifications(self, user_id: int) -> dict[str, Any]:
+        now = datetime.now(timezone.utc).replace(tzinfo=None)
         records = self.db.query(NotificationRecord).filter(
             NotificationRecord.user_id == user_id,
-            NotificationRecord.expires_at.is_(None) | (NotificationRecord.expires_at >= datetime.utcnow()),
+            NotificationRecord.expires_at.is_(None) | (NotificationRecord.expires_at >= now),
         ).order_by(NotificationRecord.created_at.desc()).all()
         return {
-            "items": [{
-                "id": item.id,
-                "category": item.category,
-                "title": item.title,
-                "message": item.message,
-                "priority": item.priority,
-                "read": item.read,
-                "created_at": item.created_at,
-            } for item in records],
+            "items": [self._serialize_notification(item) for item in records],
+        }
+
+    def get_unread_notifications(self, user_id: int) -> dict[str, Any]:
+        now = datetime.now(timezone.utc).replace(tzinfo=None)
+        records = self.db.query(NotificationRecord).filter(
+            NotificationRecord.user_id == user_id,
+            NotificationRecord.read.is_(False),
+            NotificationRecord.expires_at.is_(None) | (NotificationRecord.expires_at >= now),
+        ).order_by(NotificationRecord.created_at.desc()).all()
+        return {"items": [self._serialize_notification(item) for item in records]}
+
+    def mark_notification_read(self, user_id: int, notification_id: int) -> dict[str, Any] | None:
+        notification = self.db.query(NotificationRecord).filter(
+            NotificationRecord.user_id == user_id,
+            NotificationRecord.id == notification_id,
+        ).one_or_none()
+        if notification is None:
+            return None
+        notification.read = True
+        notification.updated_at = datetime.now(timezone.utc).replace(tzinfo=None)
+        self.db.commit()
+        self.db.refresh(notification)
+        return self._serialize_notification(notification)
+
+    @staticmethod
+    def _category_notifications_enabled(preferences, category: str) -> bool:
+        preference_by_category = {
+            "hydration": "hydration_notifications",
+            "activity": "activity_notifications",
+            "recovery": "recovery_notifications",
+        }
+        preference_field = preference_by_category.get(category)
+        return (
+            preferences.notifications_enabled
+            and (getattr(preferences, preference_field) if preference_field else True)
+        )
+
+    @staticmethod
+    def _is_quiet_time(now: datetime, start_value: str, end_value: str) -> bool:
+        try:
+            start_hour, start_minute = (int(part) for part in start_value.split(":"))
+            end_hour, end_minute = (int(part) for part in end_value.split(":"))
+            current = now.hour * 60 + now.minute
+            start = start_hour * 60 + start_minute
+            end = end_hour * 60 + end_minute
+        except (AttributeError, TypeError, ValueError):
+            return False
+        if start == end:
+            return False
+        if start < end:
+            return start <= current < end
+        return current >= start or current < end
+
+    def _generate_notifications_from_recommendations(
+        self,
+        user_id: int,
+        recommendations: list[dict[str, Any]],
+    ) -> None:
+        active_recommendations = [
+            recommendation for recommendation in recommendations
+            if recommendation.get("status") == "active"
+        ]
+        if not active_recommendations:
+            return
+
+        preferences = self.db.query(NotificationPreference).filter(
+            NotificationPreference.user_id == user_id
+        ).one_or_none()
+        if preferences is None:
+            # Keep the existing default preference behavior and persisted settings.
+            self.get_notification_preferences(user_id)
+            preferences = self.db.query(NotificationPreference).filter(
+                NotificationPreference.user_id == user_id
+            ).one_or_none()
+        if preferences is None or not preferences.notifications_enabled:
+            return
+
+        now = datetime.now(timezone.utc)
+        if self._is_quiet_time(now, preferences.quiet_hours_start, preferences.quiet_hours_end):
+            return
+
+        eligible = [
+            recommendation for recommendation in active_recommendations
+            if self._category_notifications_enabled(
+                preferences, recommendation.get("category", "")
+            )
+        ]
+        if not eligible:
+            return
+
+        # Count a rolling UTC day of in-app notifications, applying higher
+        # priority recommendations first if the user's cap is reached.
+        window_start = (now - timedelta(days=1)).replace(tzinfo=None)
+        existing_count = self.db.query(func.count(NotificationRecord.id)).filter(
+            NotificationRecord.user_id == user_id,
+            NotificationRecord.created_at >= window_start,
+        ).scalar() or 0
+        maximum = max(int(preferences.maximum_notification_frequency or 0), 0)
+        remaining = max(maximum - int(existing_count), 0)
+        pending = []
+        for recommendation in sorted(
+            eligible,
+            key=lambda item: (-int(item.get("priority", 1)), item.get("created_at")),
+        ):
+            context_date = (recommendation.get("context") or {}).get("date_utc") or now.date().isoformat()
+            context_payload = json.dumps(
+                {
+                    "context": recommendation.get("context") or {},
+                    "current_value": recommendation.get("current_value"),
+                    "reference_value": recommendation.get("reference_value"),
+                    "reason": recommendation.get("reason"),
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            context_digest = hashlib.sha256(context_payload.encode("utf-8")).hexdigest()[:16]
+            notification_key = (
+                f"{recommendation['dedupe_key']}:ctx:{context_date}:{context_digest}"
+            )
+            existing = self.db.query(NotificationRecord).filter(
+                NotificationRecord.user_id == user_id,
+                NotificationRecord.dedupe_key == notification_key,
+            ).one_or_none()
+            if existing is not None:
+                continue
+            pending.append((recommendation, notification_key))
+
+        for recommendation, notification_key in pending[:remaining]:
+            record = NotificationRecord(
+                user_id=user_id,
+                category=recommendation["category"],
+                title=recommendation["title"],
+                message=recommendation["message"],
+                priority=recommendation["priority"],
+                read=False,
+                dedupe_key=notification_key,
+                expires_at=recommendation.get("expires_at"),
+                created_at=now.replace(tzinfo=None),
+                updated_at=now.replace(tzinfo=None),
+            )
+            self.db.add(record)
+            self.db.commit()
+
+    @staticmethod
+    def _serialize_notification(item: NotificationRecord) -> dict[str, Any]:
+        now = datetime.now(timezone.utc).replace(tzinfo=None)
+        return {
+            "id": item.id,
+            "type": item.category,
+            "category": item.category,
+            "title": item.title,
+            "message": item.message,
+            "priority": item.priority,
+            "priority_label": {3: "high", 2: "medium", 1: "low"}.get(item.priority, "low"),
+            "recommendation_ref": item.dedupe_key.split(":ctx:", 1)[0],
+            "context_key": item.dedupe_key,
+            "read": item.read,
+            "delivery_state": "in_app",
+            "status": "active" if item.expires_at is None or item.expires_at >= now else "expired",
+            "created_at": item.created_at,
         }
 
     def _build_recommendation(

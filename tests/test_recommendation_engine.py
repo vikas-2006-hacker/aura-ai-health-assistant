@@ -85,6 +85,7 @@ def setup_recommendations(monkeypatch):
     service._record_recommendation = lambda user_id, payload: persisted_keys.add(
         payload["dedupe_key"]
     )
+    service._generate_notifications_from_recommendations = lambda user_id, items: None
     return service, persisted_keys
 
 
