@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import date
+from datetime import datetime, timezone
 from typing import List, Optional
 from sqlalchemy.orm import Session
 from sqlalchemy import func
@@ -31,7 +31,7 @@ class WaterRepository:
         return True
 
     def get_today(self, user_id: int) -> List[WaterIntake]:
-        today = date.today()
+        today = datetime.now(timezone.utc).date()
         return (
             self.db.query(WaterIntake)
             .filter(func.date(WaterIntake.consumed_at) == today, WaterIntake.user_id == user_id)

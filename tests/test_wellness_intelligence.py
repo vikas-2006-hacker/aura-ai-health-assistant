@@ -1,9 +1,11 @@
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 import uuid
 
 from fastapi.testclient import TestClient
 
 from app.main import app
+from app.services.wellness_service import WellnessService
 
 
 client = TestClient(app)
@@ -78,6 +80,77 @@ def create_sensor(headers, **overrides):
     assert response.status_code == 201
 
     return response
+
+
+def change_record(record_id, started_at, value, source_type="phone"):
+    return SimpleNamespace(
+        id=record_id,
+        user_id=7,
+        source_platform=source_type,
+        source_type=source_type,
+        data_type="steps",
+        value=value,
+        start_time=started_at,
+        end_time=started_at + timedelta(hours=1),
+        source_record_id=f"change-{record_id}",
+        idempotency_key=None,
+        validation_status="valid",
+    )
+
+
+def run_change_insight(monkeypatch, historical_steps, today_steps, *, mixed_timestamps=False):
+    now = datetime.now(timezone.utc)
+    records = []
+    for day_index, value in enumerate(historical_steps, start=1):
+        started_at = (now - timedelta(days=day_index)).replace(
+            hour=12, minute=0, second=0, microsecond=0
+        )
+        if mixed_timestamps and day_index % 2:
+            started_at = started_at.replace(tzinfo=None)
+        records.append(change_record(day_index, started_at, value))
+
+    current_time = now - timedelta(minutes=5)
+    records.append(change_record(100, current_time, today_steps, source_type="phone"))
+    service = WellnessService(object())
+    monkeypatch.setattr(service, "_records_for_user", lambda _user_id: records)
+    return service.get_change_insights(7)["changes"][0]
+
+
+def test_what_changed_service_aggregates_utc_today_and_historical_baseline(monkeypatch):
+    decrease = run_change_insight(monkeypatch, [6000] * 5, 4000, mixed_timestamps=True)
+    assert decrease["direction"] == "decrease"
+    assert decrease["current"] == 4000
+    assert decrease["comparison"] == 6000
+    assert decrease["baseline_status"] == "ready"
+
+    increase = run_change_insight(monkeypatch, [5000] * 5, 7000)
+    assert increase["direction"] == "increase"
+    assert increase["current"] == 7000
+    assert increase["comparison"] == 5000
+
+
+def test_what_changed_service_keeps_unknown_for_insufficient_history(monkeypatch):
+    change = run_change_insight(monkeypatch, [6000, 6000], 4000)
+    assert change["direction"] == "unknown"
+    assert change["comparison"] is None
+    assert change["difference_percent"] is None
+    assert change["baseline_status"] == "insufficient_data"
+
+
+def test_what_changed_service_prefers_wearable_without_double_counting(monkeypatch):
+    now = datetime.now(timezone.utc)
+    records = [
+        *(change_record(day, now - timedelta(days=day), 5000) for day in range(1, 4)),
+        change_record(10, now - timedelta(minutes=5), 7000, "phone"),
+        change_record(11, now - timedelta(minutes=5), 9000, "wearable"),
+    ]
+    service = WellnessService(object())
+    monkeypatch.setattr(service, "_records_for_user", lambda _user_id: records)
+
+    change = service.get_change_insights(7)["changes"][0]
+    assert change["current"] == 9000
+    assert change["comparison"] == 5000
+    assert change["direction"] == "increase"
 
 
 def test_source_resolution_prefers_wearable_then_phone_then_manual():
@@ -244,12 +317,7 @@ def test_what_changed_detects_decrease_against_personal_baseline():
             ).isoformat(),
         )
 
-    today_start = now.replace(
-        hour=8,
-        minute=0,
-        second=0,
-        microsecond=0,
-    )
+    today_start = now - timedelta(hours=1)
 
     create_sensor(
         headers,
@@ -304,12 +372,7 @@ def test_what_changed_detects_increase_against_personal_baseline():
             ).isoformat(),
         )
 
-    today_start = now.replace(
-        hour=8,
-        minute=0,
-        second=0,
-        microsecond=0,
-    )
+    today_start = now - timedelta(hours=1)
 
     create_sensor(
         headers,
@@ -349,12 +412,7 @@ def test_what_changed_handles_insufficient_baseline_history():
         microsecond=0,
     )
 
-    today_start = now.replace(
-        hour=8,
-        minute=0,
-        second=0,
-        microsecond=0,
-    )
+    today_start = now - timedelta(hours=1)
 
     create_sensor(
         headers,
@@ -387,4 +445,3 @@ def test_what_changed_handles_insufficient_baseline_history():
         change["baseline_status"]
         == "insufficient_data"
     )
-

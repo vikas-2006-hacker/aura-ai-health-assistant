@@ -10,6 +10,10 @@ class HydrationTargetResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
     target_ml: int
     basis: str
+    base_target_ml: Optional[int] = None
+    activity_level: Optional[str] = None
+    activity_adjustment_percent: Optional[float] = None
+    activity_adjustment_ml: Optional[int] = None
     explanation: Optional[str] = None
 
 
@@ -21,3 +25,9 @@ class HydrationTodayResponse(BaseModel):
     remaining_ml: int
     progress_percent: float
     status: str
+    basis: Optional[str] = None
+    base_target_ml: Optional[int] = None
+    activity_level: Optional[str] = None
+    activity_adjustment_percent: Optional[float] = None
+    activity_adjustment_ml: Optional[int] = None
+    explanation: Optional[str] = None

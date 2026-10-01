@@ -9,6 +9,9 @@ from sqlalchemy.orm import Session
 from app.models.sensor_record import SensorRecord
 from app.models.wellness import NotificationPreference, NotificationRecord, RecommendationRecord
 from app.repositories.user_repository import UserRepository
+from app.services.activity_intelligence_service import ActivityIntelligenceService
+from app.services.hydration_service import HydrationService
+from app.services.personal_baseline_service import PersonalBaselineService
 
 
 class WellnessService:
@@ -32,12 +35,16 @@ class WellnessService:
                 "data_freshness": "fresh" if active_source else "missing",
             },
             "activity": self._activity_summary(records),
-            "hydration": self._hydration_summary(records),
+            "hydration": self._hydration_summary(user_id),
             "recovery": self._recovery_summary(records),
         }
 
     def _records_for_user(self, user_id: int):
-        recent_window_start = datetime.now(timezone.utc) - timedelta(days=30)
+        # SensorRecord timestamps use naive UTC in the database. Bind a naive
+        # UTC cutoff so PostgreSQL does not interpret it in the session TZ.
+        recent_window_start = (
+            datetime.now(timezone.utc) - timedelta(days=30)
+        ).replace(tzinfo=None)
         records = self.db.query(SensorRecord).filter(
             SensorRecord.user_id == user_id,
             SensorRecord.start_time >= recent_window_start,
@@ -85,12 +92,29 @@ class WellnessService:
             "explanation": "The system used available step and duration records to classify today’s activity level.",
         }
 
-    def _hydration_summary(self, records):
-        hydration_ml = sum(record.value for record in records if record.data_type == "hydration")
+    def _hydration_summary(self, user_id: int):
+        try:
+            hydration = HydrationService(self.db).get_today(user_id)
+        except ValueError as exc:
+            return {
+                "current_ml": None,
+                "target_ml": None,
+                "remaining_ml": None,
+                "progress_percent": None,
+                "status": "unavailable",
+                "basis": None,
+                "explanation": str(exc),
+            }
         return {
-            "current_ml": int(hydration_ml),
-            "target_ml": 2500,
-            "status": "on track" if hydration_ml >= 2000 else "needs attention",
+            "current_ml": hydration["consumed_ml"],
+            "target_ml": hydration["target_ml"],
+            "remaining_ml": hydration["remaining_ml"],
+            "progress_percent": hydration["progress_percent"],
+            "status": hydration["status"],
+            "basis": hydration["basis"],
+            "activity_level": hydration["activity_level"],
+            "activity_adjustment_percent": hydration["activity_adjustment_percent"],
+            "explanation": hydration["explanation"],
         }
 
     def _recovery_summary(self, records):
@@ -143,47 +167,41 @@ class WellnessService:
     def get_change_insights(self, user_id: int) -> dict[str, Any]:
         reference_time = datetime.now(timezone.utc)
         records = self._records_for_user(user_id)
-
-        today_start = reference_time.replace(
-            hour=0,
-            minute=0,
-            second=0,
-            microsecond=0,
-        )
+        utc_today = reference_time.date()
 
         def normalize_record_time(record_time: datetime) -> datetime:
-            if record_time.tzinfo is None:
-                return record_time.replace(tzinfo=timezone.utc)
-            return record_time.astimezone(timezone.utc)
+            # ActivityIntelligenceService handles the project's naive-UTC
+            # database convention and converts aware values to UTC.
+            normalized = ActivityIntelligenceService._normalize_datetime(record_time)
+            return normalized.replace(tzinfo=timezone.utc)
 
-        # -----------------------------
-        # Today's steps
-        # -----------------------------
-        # -----------------------------
-        # Historical daily steps
-        # -----------------------------
+        # Reuse the established source identity deduplication. Resolve source
+        # preference separately for each UTC day so one day's wearable feed
+        # does not discard another day's phone-only history.
+        unique_records = ActivityIntelligenceService._deduplicate(records)
+        daily_records = {}
+        for record in unique_records:
+            if (
+                record.data_type != "steps"
+                or record.validation_status != "valid"
+                or record.value is None
+                or float(record.value) < 0
+            ):
+                continue
+            record_time = normalize_record_time(record.start_time)
+            if record_time > reference_time:
+                continue
+            daily_records.setdefault(record_time.date(), []).append(record)
+
         historical_daily_values = {}
         current_steps = 0.0
-
-        for record in records:
-            if record.data_type != "steps":
-                continue
-
-            record_time = normalize_record_time(record.start_time)
-
-            if today_start <= record_time <= reference_time:
-                current_steps += float(record.value)
-                continue
-
-            if record_time >= today_start:
-                continue
-
-            day = record_time.date()
-
-            historical_daily_values[day] = (
-                historical_daily_values.get(day, 0.0)
-                + float(record.value)
-            )
+        for day, day_records in daily_records.items():
+            resolved_records = ActivityIntelligenceService._prefer_sources(day_records)
+            daily_total = sum(float(record.value) for record in resolved_records)
+            if day == utc_today:
+                current_steps = daily_total
+            elif day < utc_today:
+                historical_daily_values[day] = daily_total
 
         # -----------------------------
         # Not enough history
@@ -275,10 +293,219 @@ class WellnessService:
         }
 
     def get_recovery_insights(self, user_id: int) -> dict[str, Any]:
-        return self._recovery_summary(self._records_for_user(user_id))
+        reference_time = datetime.now(timezone.utc)
+        window_start = reference_time - timedelta(days=7)
+        activity = ActivityIntelligenceService(self.db).summarize_for_user(
+            user_id,
+            window_start,
+            reference_time,
+        )
+
+        # Baseline windows and SQL DateTime columns use naive UTC in this app.
+        baseline_reference = (reference_time - timedelta(days=7)).replace(tzinfo=None)
+        steps_baseline = PersonalBaselineService(self.db).get_baseline(
+            user_id,
+            "steps",
+            reference_time=baseline_reference,
+        )
+        duration_baseline = PersonalBaselineService(self.db).get_baseline(
+            user_id,
+            "activity_duration",
+            reference_time=baseline_reference,
+        )
+
+        try:
+            hydration = HydrationService(self.db).get_today(user_id)
+        except ValueError:
+            hydration = None
+
+        baseline_ready = steps_baseline["status"] == "ready"
+        step_baseline_value = steps_baseline["baseline_value"]
+        duration_baseline_value = duration_baseline["baseline_value"]
+        activity_available = bool(activity["source_types"])
+
+        comparison = None
+        activity_ratio = None
+        if baseline_ready and step_baseline_value and step_baseline_value > 0:
+            comparison = round(step_baseline_value * 7, 2)
+            activity_ratio = activity["steps"] / comparison
+
+        if activity_ratio is None:
+            activity_level = activity["classification"]
+        elif activity_ratio >= 1.5:
+            activity_level = "high"
+        elif activity_ratio >= 0.85:
+            activity_level = "moderate"
+        else:
+            activity_level = "low"
+
+        activity_load = {
+            "level": activity_level,
+            "steps": activity["steps"],
+            "activity_duration_seconds": activity["activity_duration_seconds"],
+            "classification": activity["classification"],
+            "period_days": 7,
+            "comparison_to_baseline": {
+                "status": steps_baseline["status"],
+                "recent_steps": activity["steps"],
+                "baseline_steps": comparison,
+                "ratio": round(activity_ratio, 3) if activity_ratio is not None else None,
+            },
+        }
+
+        hydration_context = {
+            "available": hydration is not None,
+            "consumed_ml": hydration["consumed_ml"] if hydration else None,
+            "target_ml": hydration["target_ml"] if hydration else None,
+            "progress_percent": hydration["progress_percent"] if hydration else None,
+            "status": hydration["status"] if hydration else "unavailable",
+            "explanation": (
+                "Hydration progress is below today's target."
+                if hydration and hydration["consumed_ml"] < hydration["target_ml"]
+                else "Hydration progress has reached today's target."
+                if hydration
+                else "No supported hydration data is available."
+            ),
+        }
+
+        signals = {
+            "activity": {
+                "available": activity_available,
+                "reason": None if activity_available else "No supported activity data is available",
+            },
+            "steps_baseline": {
+                "available": baseline_ready,
+                "reason": None if baseline_ready else "At least three historical activity days are required",
+                "status": steps_baseline["status"],
+                "observations": steps_baseline["observations"],
+                "daily_average": step_baseline_value,
+            },
+            "activity_duration_baseline": {
+                "available": duration_baseline["status"] == "ready",
+                "reason": None if duration_baseline["status"] == "ready" else "No sufficient historical duration data is available",
+                "status": duration_baseline["status"],
+                "daily_average_seconds": duration_baseline_value,
+            },
+            "hydration": {
+                "available": hydration is not None,
+                "reason": None if hydration is not None else "No supported data available",
+            },
+        }
+        for signal_name in ("sleep", "hrv", "heart_rate", "stress", "temperature"):
+            signals[signal_name] = {
+                "available": False,
+                "reason": "No supported data available",
+            }
+
+        drivers = []
+        if activity_available and activity_ratio is not None:
+            if activity_ratio >= 1.2:
+                direction = "negative"
+                activity_explanation = "Recent activity is above your personal baseline, increasing recovery demand."
+            elif activity_ratio <= 0.8:
+                direction = "contextual"
+                activity_explanation = "Recent activity is below your personal baseline; lower activity alone does not establish recovery."
+            else:
+                direction = "neutral"
+                activity_explanation = "Recent activity is close to your personal baseline."
+            drivers.append({
+                "metric": "activity_load",
+                "direction": direction,
+                "value": activity["steps"],
+                "comparison": comparison,
+                "explanation": activity_explanation,
+            })
+
+        if hydration is not None:
+            hydration_on_track = hydration["consumed_ml"] >= hydration["target_ml"]
+            drivers.append({
+                "metric": "hydration",
+                "direction": "positive" if hydration_on_track else "negative",
+                "value": hydration["consumed_ml"],
+                "target": hydration["target_ml"],
+                "explanation": hydration_context["explanation"],
+            })
+
+        confidence = 0.0
+        if activity_available:
+            confidence = 0.35
+            if baseline_ready:
+                confidence += 0.35
+            if hydration is not None:
+                confidence += 0.15
+            if "wearable" in activity["source_types"]:
+                confidence += 0.1
+            confidence = round(min(confidence, 0.95), 2)
+
+        score = None
+        if activity_available and baseline_ready and activity_ratio is not None:
+            score = 70
+            if activity_ratio >= 1.5:
+                score -= 25
+            elif activity_ratio >= 1.2:
+                score -= 15
+            elif activity_ratio >= 1.05:
+                score -= 8
+            if hydration is not None and hydration["target_ml"] > 0:
+                hydration_ratio = hydration["consumed_ml"] / hydration["target_ml"]
+                if hydration_ratio < 0.6:
+                    score -= 10
+                elif hydration_ratio < 1.0:
+                    score -= 5
+            score = max(0, min(100, score))
+            state = "good" if score >= 70 else "moderate" if score >= 50 else "low"
+            if activity_ratio <= 0.8 and state == "good":
+                state = "moderate"
+            if activity_ratio >= 1.5:
+                state = "low" if score < 60 else "moderate"
+        else:
+            state = "unknown"
+
+        if state == "unknown":
+            explanation = (
+                "Recovery confidence is limited because AURA needs activity data and at least three historical activity days "
+                "to compare recent load with your personal baseline."
+                if not baseline_ready
+                else "Recovery cannot be assessed because no supported activity data is available."
+            )
+            recommendations = ["AURA needs more activity history before providing a stronger recovery assessment."]
+        else:
+            explanation_parts = []
+            if activity_ratio >= 1.2:
+                explanation_parts.append("Your recent activity is above your personal baseline, which increases recovery demand.")
+            elif activity_ratio <= 0.8:
+                explanation_parts.append("Your recent activity is below your personal baseline; this alone does not indicate good recovery.")
+            else:
+                explanation_parts.append("Your recent activity is close to your personal baseline.")
+            if hydration is None:
+                explanation_parts.append("Hydration data is unavailable, so it was not included in the score.")
+            elif hydration["consumed_ml"] < hydration["target_ml"]:
+                explanation_parts.append("Hydration progress is below today's target.")
+            else:
+                explanation_parts.append("Hydration progress has reached today's target.")
+            explanation = " ".join(explanation_parts)
+            if state == "good":
+                recommendations = ["Your available signals suggest a manageable activity load. Continue your planned routine."]
+            elif state == "low":
+                recommendations = ["Consider reducing high-intensity activity today.", "Prioritize hydration and recovery."]
+            else:
+                recommendations = ["Consider keeping today's activity moderate.", "Prioritize hydration and allow additional recovery time if you feel fatigued."]
+
+        return {
+            "state": state,
+            "score": score,
+            "confidence": confidence,
+            "baseline_status": steps_baseline["status"],
+            "activity_load": activity_load,
+            "hydration_context": hydration_context,
+            "signals": signals,
+            "drivers": drivers,
+            "recommendations": recommendations,
+            "explanation": explanation,
+        }
 
     def get_hydration_insights(self, user_id: int) -> dict[str, Any]:
-        return self._hydration_summary(self._records_for_user(user_id))
+        return self._hydration_summary(user_id)
 
     def get_notification_preferences(self, user_id: int) -> dict[str, Any]:
         preferences = self.db.query(NotificationPreference).filter(NotificationPreference.user_id == user_id).one_or_none()

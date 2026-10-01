@@ -71,6 +71,7 @@ class PersonalBaselineService:
         )
 
         records = self._deduplicate(records)
+        records = ActivityIntelligenceService._prefer_sources(records)
         records = [
             record
             for record in records
