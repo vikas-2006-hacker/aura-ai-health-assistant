@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, time, timedelta, timezone
 from typing import Any
 
 from sqlalchemy import or_
@@ -125,44 +125,148 @@ class WellnessService:
         return {"state": "moderate", "confidence": 0.7, "explanation": "Recent activity and available movement data suggest a moderate recovery pattern."}
 
     def get_recommendations(self, user_id: int) -> dict[str, Any]:
-        records = self._records_for_user(user_id)
-        if not records:
-            return {"items": [], "generated_at": datetime.utcnow()}
+        now = datetime.now(timezone.utc)
+        today_start = datetime.combine(now.date(), time.min, tzinfo=timezone.utc)
+        baseline_reference = today_start.replace(tzinfo=None)
+        activity = ActivityIntelligenceService(self.db).summarize_for_user(
+            user_id, today_start, now
+        )
+        baseline = PersonalBaselineService(self.db).get_baseline(
+            user_id, "steps", reference_time=baseline_reference
+        )
+        change = self.get_change_insights(user_id)["changes"][0]
+        try:
+            hydration = HydrationService(self.db).get_today(user_id)
+        except ValueError:
+            hydration = None
+        recovery = self.get_recovery_insights(user_id)
 
         items = []
-        source_resolution = self._resolve_active_source(records)
-        if source_resolution == "manual":
-            return {"items": [], "generated_at": datetime.utcnow()}
-
-        total_steps = sum(record.value for record in records if record.data_type == "steps")
-        if total_steps <= 1500:
-            items.append(self._build_recommendation(
-                user_id,
-                category="activity",
-                title="Short walk suggestion",
-                message="Your activity is lower than your usual level today. A short walk could help you stay active.",
-                reason="Recent step totals are below the day’s expected range for this user.",
-                priority=2,
-                confidence=0.8,
-                source_metrics=["steps"],
-            ))
-
-        if total_steps >= 10000:
+        source_types = activity.get("source_types", [])
+        if (
+            hydration is not None
+            and hydration["progress_percent"] <= 60
+            and hydration["remaining_ml"] >= 500
+        ):
+            adjustment_ml = hydration.get("activity_adjustment_ml", 0) or 0
+            reason = (
+                f"Today's hydration progress is {hydration['progress_percent']:.1f}% "
+                f"with {hydration['remaining_ml']} ml remaining."
+            )
+            if adjustment_ml > 0:
+                reason += (
+                    f" The target includes a {adjustment_ml} ml adjustment for "
+                    f"{hydration.get('activity_level')} activity."
+                )
+            else:
+                reason += " The target is based on the available profile weight."
             items.append(self._build_recommendation(
                 user_id,
                 category="hydration",
-                title="Hydration reminder",
-                message="Your activity is higher than usual today. Consider taking a hydration break.",
-                reason="Movement volume is elevated compared with your recent baseline in the available records.",
-                priority=3,
+                title="Hydration progress reminder",
+                message="Consider drinking water gradually as you continue your day.",
+                reason=reason,
+                priority=3 if hydration["progress_percent"] <= 30 else 2,
                 confidence=0.8,
-                source_metrics=["steps"],
+                source_metrics=["hydration_progress", "remaining_ml"],
+                metric="hydration_progress",
+                current_value=hydration["progress_percent"],
+                reference_value=100.0,
+                confidence_state="supported_profile_and_intake",
+                context={
+                    "date_utc": now.date().isoformat(),
+                    "target_ml": hydration["target_ml"],
+                    "remaining_ml": hydration["remaining_ml"],
+                    "activity_level": hydration.get("activity_level"),
+                    "activity_adjustment_ml": adjustment_ml,
+                },
+            ))
+
+        # What Changed supplies the current value, direction, and comparison.
+        # Suppress activity rules if today's source or baseline is unavailable.
+        difference = change.get("difference_percent")
+        if (
+            source_types
+            and baseline.get("status") == "ready"
+            and change.get("baseline_status") == "ready"
+            and difference is not None
+        ):
+            rule = None
+            if change["direction"] == "decrease" and difference <= -25:
+                rule = (
+                    "Movement break suggestion",
+                    "A short walk or movement break may help you add some activity today.",
+                    2 if difference <= -50 else 1,
+                    f"Today's {change['current']:g} steps are {abs(difference):.1f}% below "
+                    f"your personal baseline of {change['comparison']:g} steps.",
+                )
+            elif change["direction"] == "increase" and difference >= 50:
+                rule = (
+                    "Higher activity context",
+                    "Your activity is well above your recent baseline; consider balancing effort with rest.",
+                    1,
+                    f"Today's {change['current']:g} steps are {difference:.1f}% above "
+                    f"your personal baseline of {change['comparison']:g} steps.",
+                )
+            if rule is not None:
+                title, message, priority, reason = rule
+                items.append(self._build_recommendation(
+                    user_id,
+                    category="activity",
+                    title=title,
+                    message=message,
+                    reason=reason,
+                    priority=priority,
+                    confidence=0.7,
+                    source_metrics=["steps", "personal_baseline"],
+                    metric="steps",
+                    current_value=change["current"],
+                    reference_value=change["comparison"],
+                    confidence_state="today_and_baseline_available",
+                    context={
+                        "date_utc": now.date().isoformat(),
+                        "source_types": source_types,
+                        "baseline_observations": baseline.get("observations"),
+                        "difference_percent": difference,
+                    },
+                ))
+
+        recovery_score = recovery.get("score")
+        negative_drivers = [
+            driver for driver in recovery.get("drivers", [])
+            if driver.get("direction") == "negative"
+        ]
+        if recovery_score is not None and recovery_score <= 55 and negative_drivers:
+            items.append(self._build_recommendation(
+                user_id,
+                category="recovery",
+                title="Recovery support suggestion",
+                message="Consider keeping your next activity session lighter and allowing time to recover.",
+                reason=recovery.get(
+                    "explanation",
+                    "Available recovery drivers indicate additional recovery demand.",
+                ),
+                priority=3 if recovery_score <= 45 else 2,
+                confidence=recovery.get("confidence") or 0.5,
+                source_metrics=[driver["metric"] for driver in negative_drivers],
+                metric="recovery_score",
+                current_value=recovery_score,
+                reference_value=70,
+                confidence_state="recovery_inputs_available",
+                context={
+                    "date_utc": now.date().isoformat(),
+                    "state": recovery.get("state"),
+                    "drivers": negative_drivers,
+                },
             ))
 
         for item in items:
             self._record_recommendation(user_id, item)
 
-        return {"items": [self._serialize_recommendation(item) for item in items], "generated_at": datetime.utcnow()}
+        return {
+            "items": [self._serialize_recommendation(item) for item in items],
+            "generated_at": now.replace(tzinfo=None),
+        }
 
     def get_change_insights(self, user_id: int) -> dict[str, Any]:
         reference_time = datetime.now(timezone.utc)
@@ -571,7 +675,26 @@ class WellnessService:
             } for item in records],
         }
 
-    def _build_recommendation(self, user_id: int, *, category: str, title: str, message: str, reason: str, priority: int, confidence: float, source_metrics: list[str]) -> dict[str, Any]:
+    def _build_recommendation(
+        self,
+        user_id: int,
+        *,
+        category: str,
+        title: str,
+        message: str,
+        reason: str,
+        priority: int,
+        confidence: float,
+        source_metrics: list[str],
+        metric: str | None = None,
+        current_value: float | None = None,
+        reference_value: float | None = None,
+        confidence_state: str = "supported",
+        context: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        # Persist naive UTC because the existing SQL DateTime columns are
+        # timezone-naive; calculation and date boundaries stay aware UTC.
+        created_at = datetime.now(timezone.utc).replace(tzinfo=None)
         return {
             "id": f"{user_id}:{category}:{title.lower().replace(' ', '-')}",
             "category": category,
@@ -580,9 +703,16 @@ class WellnessService:
             "reason": reason,
             "priority": priority,
             "confidence": confidence,
-            "created_at": datetime.utcnow(),
-            "expires_at": datetime.utcnow() + timedelta(days=1),
+            "priority_label": {3: "high", 2: "medium", 1: "low"}.get(priority, "low"),
+            "created_at": created_at,
+            "expires_at": created_at + timedelta(days=1),
             "source_metrics": source_metrics,
+            "metric": metric,
+            "current_value": current_value,
+            "reference_value": reference_value,
+            "confidence_state": confidence_state,
+            "context": context or {},
+            "status": "active",
             "dedupe_key": f"{user_id}:{category}:{title.lower().replace(' ', '-')}",
         }
 
@@ -618,7 +748,14 @@ class WellnessService:
             "reason": payload["reason"],
             "priority": payload["priority"],
             "confidence": payload["confidence"],
+            "priority_label": payload["priority_label"],
             "created_at": payload["created_at"],
             "expires_at": payload["expires_at"],
             "source_metrics": payload["source_metrics"],
+            "metric": payload["metric"],
+            "current_value": payload["current_value"],
+            "reference_value": payload["reference_value"],
+            "confidence_state": payload["confidence_state"],
+            "context": payload["context"],
+            "status": payload["status"],
         }

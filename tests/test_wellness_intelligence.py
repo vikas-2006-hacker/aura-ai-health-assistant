@@ -233,12 +233,25 @@ def test_source_resolution_prefers_wearable_then_phone_then_manual():
 def test_recommendation_engine_generates_and_suppresses_duplicates():
     headers = register_and_login()
 
+    now = datetime.now(timezone.utc).replace(microsecond=0)
+    for day in range(1, 5):
+        historical_start = (now - timedelta(days=day)).replace(hour=12, minute=0, second=0)
+        create_sensor(
+            headers,
+            value=5000,
+            source_record_id=f"recommendation-baseline-{day}",
+            start_time=historical_start.isoformat(),
+            end_time=(historical_start + timedelta(hours=1)).isoformat(),
+        )
+
     create_sensor(
         headers,
         source_type="phone",
         source_platform="health_connect",
         value=1200,
         source_record_id="low-activity",
+        start_time=(now - timedelta(hours=1)).isoformat(),
+        end_time=now.isoformat(),
     )
 
     first = client.get(
