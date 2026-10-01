@@ -6,6 +6,10 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.orm import Session
 
 from app.database.session import get_db
+from app.schemas.notification_preferences import (
+    NotificationPreferencesResponse,
+    NotificationPreferencesUpdate,
+)
 from app.services.auth_service import get_current_user
 from app.services.wellness_service import WellnessService
 
@@ -22,14 +26,34 @@ def recommendations(db: Session = Depends(get_db), user=Depends(get_current_user
     return WellnessService(db).get_recommendations(user.id)
 
 
-@router.get("/notifications/preferences", status_code=status.HTTP_200_OK)
+@router.get(
+    "/notifications/preferences",
+    status_code=status.HTTP_200_OK,
+    response_model=NotificationPreferencesResponse,
+)
 def notification_preferences(db: Session = Depends(get_db), user=Depends(get_current_user)) -> dict:
     return WellnessService(db).get_notification_preferences(user.id)
 
 
-@router.post("/notifications/preferences", status_code=status.HTTP_200_OK)
-def update_notification_preferences(payload: dict, db: Session = Depends(get_db), user=Depends(get_current_user)) -> dict:
-    return WellnessService(db).update_notification_preferences(user.id, payload)
+@router.post(
+    "/notifications/preferences",
+    status_code=status.HTTP_200_OK,
+    response_model=NotificationPreferencesResponse,
+)
+@router.patch(
+    "/notifications/preferences",
+    status_code=status.HTTP_200_OK,
+    response_model=NotificationPreferencesResponse,
+)
+def update_notification_preferences(
+    payload: NotificationPreferencesUpdate,
+    db: Session = Depends(get_db),
+    user=Depends(get_current_user),
+) -> dict:
+    return WellnessService(db).update_notification_preferences(
+        user.id,
+        payload.model_dump(exclude_unset=True),
+    )
 
 
 @router.get("/notifications", status_code=status.HTTP_200_OK)

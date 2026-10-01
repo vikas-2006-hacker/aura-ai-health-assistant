@@ -43,6 +43,7 @@ class NotificationPreference(Base):
     hydration_notifications: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
     activity_notifications: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
     recovery_notifications: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    wellness_notifications: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
     quiet_hours_start: Mapped[str] = mapped_column(String(5), nullable=False, default="22:00")
     quiet_hours_end: Mapped[str] = mapped_column(String(5), nullable=False, default="07:00")
     maximum_notification_frequency: Mapped[int] = mapped_column(Integer, nullable=False, default=3)

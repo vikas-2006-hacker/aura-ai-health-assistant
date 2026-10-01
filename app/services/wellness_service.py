@@ -624,6 +624,7 @@ class WellnessService:
                 hydration_notifications=True,
                 activity_notifications=True,
                 recovery_notifications=True,
+                wellness_notifications=True,
                 quiet_hours_start="22:00",
                 quiet_hours_end="07:00",
                 maximum_notification_frequency=3,
@@ -636,6 +637,7 @@ class WellnessService:
             "hydration_notifications": preferences.hydration_notifications,
             "activity_notifications": preferences.activity_notifications,
             "recovery_notifications": preferences.recovery_notifications,
+            "wellness_notifications": preferences.wellness_notifications,
             "quiet_hours": {"start": preferences.quiet_hours_start, "end": preferences.quiet_hours_end},
             "maximum_notification_frequency": preferences.maximum_notification_frequency,
         }
@@ -650,6 +652,7 @@ class WellnessService:
             "hydration_notifications",
             "activity_notifications",
             "recovery_notifications",
+            "wellness_notifications",
             "maximum_notification_frequency",
         ]:
             if field in payload:
@@ -700,6 +703,7 @@ class WellnessService:
             "hydration": "hydration_notifications",
             "activity": "activity_notifications",
             "recovery": "recovery_notifications",
+            "wellness": "wellness_notifications",
         }
         preference_field = preference_by_category.get(category)
         return (

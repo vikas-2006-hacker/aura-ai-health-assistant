@@ -7,6 +7,7 @@ from sqlalchemy.orm import Session
 from app.database.base import Base
 from app.models.user import User
 from app.models.wellness import NotificationPreference, NotificationRecord
+from app.schemas.notification_preferences import NotificationPreferencesUpdate
 from app.services import wellness_service
 from app.services.wellness_service import WellnessService
 
@@ -87,6 +88,7 @@ def test_suppressed_recommendations_do_not_create_notifications(notification_db)
         ("hydration_notifications", "hydration"),
         ("activity_notifications", "activity"),
         ("recovery_notifications", "recovery"),
+        ("wellness_notifications", "wellness"),
     ],
 )
 def test_disabled_notification_preferences_suppress_creation(notification_db, preference, category):
@@ -156,6 +158,113 @@ def test_quiet_hours_suppress_notifications(notification_db):
 
     service._generate_notifications_from_recommendations(1, [recommendation()])
     assert service.get_notifications(1)["items"] == []
+
+
+def test_quiet_hour_boundaries_and_overnight_window():
+    service = WellnessService(object())
+    assert service._is_quiet_time(datetime(2026, 10, 1, 22, 0), "22:00", "07:00")
+    assert service._is_quiet_time(datetime(2026, 10, 1, 23, 59), "22:00", "07:00")
+    assert service._is_quiet_time(datetime(2026, 10, 1, 6, 59), "22:00", "07:00")
+    assert not service._is_quiet_time(datetime(2026, 10, 1, 7, 0), "22:00", "07:00")
+    assert not service._is_quiet_time(datetime(2026, 10, 1, 12, 0), "22:00", "07:00")
+
+
+def test_preferences_default_update_and_validation(notification_db):
+    service = WellnessService(notification_db)
+    defaults = service.get_notification_preferences(1)
+    assert defaults["notifications_enabled"] is True
+    assert defaults["wellness_notifications"] is True
+    assert defaults["quiet_hours"] == {"start": "00:00", "end": "00:00"}
+
+    update = NotificationPreferencesUpdate.model_validate({
+        "notifications_enabled": False,
+        "hydration_notifications": False,
+        "activity_notifications": True,
+        "recovery_notifications": False,
+        "wellness_notifications": False,
+        "quiet_hours": {"start": "21:30", "end": "06:45"},
+        "maximum_notification_frequency": 5,
+    })
+    saved = service.update_notification_preferences(
+        1, update.model_dump(exclude_unset=True)
+    )
+    assert saved["notifications_enabled"] is False
+    assert saved["hydration_notifications"] is False
+    assert saved["activity_notifications"] is True
+    assert saved["recovery_notifications"] is False
+    assert saved["wellness_notifications"] is False
+    assert saved["quiet_hours"] == {"start": "21:30", "end": "06:45"}
+    assert saved["maximum_notification_frequency"] == 5
+    assert service.get_notification_preferences(2)["notifications_enabled"] is True
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"notifications_enabled": "false"},
+        {"wellness_notifications": 1},
+        {"maximum_notification_frequency": -1},
+        {"maximum_notification_frequency": 11},
+        {"maximum_notification_frequency": True},
+        {"quiet_hours": {"start": "24:00"}},
+        {"quiet_hours": {"end": "7:00"}},
+        {"unexpected": True},
+        {},
+    ],
+)
+def test_invalid_preference_values_are_rejected(payload):
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError):
+        NotificationPreferencesUpdate.model_validate(payload)
+
+
+def test_reenabling_category_allows_future_notification_and_keeps_history(notification_db):
+    service = WellnessService(notification_db)
+    preferences = notification_db.query(NotificationPreference).filter_by(user_id=1).one()
+    preferences.hydration_notifications = False
+    notification_db.commit()
+    candidate = recommendation(category="hydration")
+
+    service._generate_notifications_from_recommendations(1, [candidate])
+    assert service.get_notifications(1)["items"] == []
+
+    preferences.hydration_notifications = True
+    notification_db.commit()
+    service._generate_notifications_from_recommendations(1, [candidate])
+    assert len(service.get_notifications(1)["items"]) == 1
+
+    preferences.notifications_enabled = False
+    notification_db.commit()
+    assert len(service.get_notifications(1)["items"]) == 1
+
+
+def test_frequency_cap_updates_apply_to_future_notifications(notification_db):
+    service = WellnessService(notification_db)
+    preferences = notification_db.query(NotificationPreference).filter_by(user_id=1).one()
+    preferences.maximum_notification_frequency = 1
+    notification_db.commit()
+    candidates = [
+        recommendation(category="hydration", title="Hydration"),
+        recommendation(category="recovery", title="Recovery", priority=2),
+    ]
+    service._generate_notifications_from_recommendations(1, candidates)
+    assert len(service.get_notifications(1)["items"]) == 1
+
+    preferences.maximum_notification_frequency = 2
+    notification_db.commit()
+    service._generate_notifications_from_recommendations(1, candidates)
+    assert len(service.get_notifications(1)["items"]) == 2
+
+
+def test_marking_an_already_read_notification_is_safe(notification_db):
+    service = WellnessService(notification_db)
+    service._generate_notifications_from_recommendations(
+        1, [recommendation(category="activity", title="Activity")]
+    )
+    item = service.get_notifications(1)["items"][0]
+    assert service.mark_notification_read(1, item["id"])["read"] is True
+    assert service.mark_notification_read(1, item["id"])["read"] is True
 
 
 def test_recommendation_pipeline_creates_one_notification(notification_db, monkeypatch):

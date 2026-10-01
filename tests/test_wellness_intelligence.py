@@ -308,6 +308,59 @@ def test_notification_preferences_and_deduplication():
     assert "items" in notification_response.json()
 
 
+def test_notification_preferences_patch_validation_and_user_isolation():
+    first_headers = register_and_login()
+    second_headers = register_and_login()
+
+    first_defaults = client.get(
+        "/notifications/preferences",
+        headers=first_headers,
+    )
+    second_defaults = client.get(
+        "/notifications/preferences",
+        headers=second_headers,
+    )
+    assert first_defaults.status_code == 200
+    assert first_defaults.json()["wellness_notifications"] is True
+    assert first_defaults.json()["maximum_notification_frequency"] == 3
+
+    update = client.patch(
+        "/notifications/preferences",
+        headers=first_headers,
+        json={
+            "notifications_enabled": False,
+            "hydration_notifications": False,
+            "wellness_notifications": False,
+            "quiet_hours": {"start": "20:30", "end": "06:30"},
+            "maximum_notification_frequency": 4,
+        },
+    )
+    assert update.status_code == 200
+    assert update.json()["notifications_enabled"] is False
+    assert update.json()["hydration_notifications"] is False
+    assert update.json()["wellness_notifications"] is False
+    assert update.json()["quiet_hours"] == {"start": "20:30", "end": "06:30"}
+    assert update.json()["maximum_notification_frequency"] == 4
+
+    invalid = client.patch(
+        "/notifications/preferences",
+        headers=first_headers,
+        json={"notifications_enabled": "false"},
+    )
+    assert invalid.status_code == 422
+    invalid_quiet_hours = client.patch(
+        "/notifications/preferences",
+        headers=first_headers,
+        json={"quiet_hours": {"start": "24:00"}},
+    )
+    assert invalid_quiet_hours.status_code == 422
+
+    second = client.get("/notifications/preferences", headers=second_headers)
+    assert second.status_code == 200
+    assert second.json()["notifications_enabled"] is True
+    assert second.json()["wellness_notifications"] is True
+
+
 def test_what_changed_detects_decrease_against_personal_baseline():
     headers = register_and_login()
 
